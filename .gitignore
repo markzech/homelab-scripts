@@ -1,0 +1,81 @@
+# macOS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows Files
+desktop.ini
+$RECYCLE.BIN/
+
+# Linux Files
+*~
+.directory
+
+# Temporary Files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.#*
+#*#
+
+# Log Files
+*.log
+logs/
+*.log.*
+
+# Backup Files
+*.bak
+*.backup
+*.old
+*-backup
+*-old
+
+# Secret/Credential Files
+secrets/
+*.env
+.env
+.env.*
+config.env
+credentials/
+passwords/
+keys/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Proxmox Backup Files
+*.vma
+*.vma.gz
+*.vma.lzo
+*.vma.zst
+
+# Database Files (unless specifically needed)
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache Directories
+cache/
+.cache/
+tmp/
+temp/
+
+# IDE/Editor Files
+.vscode/
+.idea/
+*.sublime-*
+.vim/
+.nvim/
+
+# System Files
+.Trash/
+.fseventsd/
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
