@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Nextcloud WebDAV sync script - Secrets-integrated version
-# Place in: /usr/local/bin/nextcloud-sync.sh
+# Nextcloud WebDAV sync script - Improved version with timeouts and progress
+# Place in: /opt/homelab/scripts/nextcloud-sync/nextcloud-sync.sh
 
 set -e
 
 # Script metadata
 SCRIPT_NAME="nextcloud-sync"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 
 # Secrets file location
 SECRETS_FILE="/etc/homelab/secrets/config.env"
@@ -18,17 +18,6 @@ if [ -f "$SECRETS_FILE" ]; then
     echo "Loaded configuration from $SECRETS_FILE"
 else
     echo "ERROR: Secrets file not found at $SECRETS_FILE"
-    echo "Please create the secrets file with your credentials:"
-    echo "sudo mkdir -p /etc/homelab/secrets"
-    echo "sudo nano $SECRETS_FILE"
-    echo ""
-    echo "Required variables in secrets file:"
-    echo "NEXTCLOUD_URL=\"https://your-nextcloud-instance.com\""
-    echo "NEXTCLOUD_USER=\"your-username\""
-    echo "NEXTCLOUD_PASS=\"your-app-password\""
-    echo "HASS_IP=\"10.0.0.110\""
-    echo "MQTT_USER=\"nextcloud-sync\""
-    echo "MQTT_PASS=\"sync-password\""
     exit 1
 fi
 
@@ -46,6 +35,9 @@ LOGFILE="${LOGFILE:-/var/log/nextcloud-sync.log}"
 MOUNT_POINT="${MOUNT_POINT:-/mnt/truenas}"
 SYNC_DIR="${SYNC_DIR:-$MOUNT_POINT/nextcloud-backup}"
 RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
+
+# Sync timeout (30 minutes)
+SYNC_TIMEOUT=1800
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOGFILE"
@@ -77,11 +69,11 @@ EOF
 # Test Nextcloud connection
 test_connection() {
     log "Testing Nextcloud WebDAV connection..."
-    if rclone lsd nextcloud: --config "$RCLONE_CONFIG" >/dev/null 2>&1; then
+    if timeout 30 rclone lsd nextcloud: --config "$RCLONE_CONFIG" >/dev/null 2>&1; then
         log "Nextcloud connection successful"
         return 0
     else
-        log "Nextcloud connection failed"
+        log "Nextcloud connection failed or timed out"
         return 1
     fi
 }
@@ -91,7 +83,7 @@ send_mqtt() {
     local topic="$1"
     local message="$2"
     if command -v mosquitto_pub >/dev/null 2>&1; then
-        mosquitto_pub -h "$HASS_IP" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$topic" -m "$message" >/dev/null 2>&1
+        timeout 10 mosquitto_pub -h "$HASS_IP" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$topic" -m "$message" >/dev/null 2>&1
         if [ $? -eq 0 ]; then
             log "MQTT sent: $topic = $message"
         else
@@ -102,9 +94,26 @@ send_mqtt() {
     fi
 }
 
+# Check available memory before sync
+check_resources() {
+    local available_mem=$(free -m | awk 'NR==2{printf "%d", $7}')
+    local available_space=$(df "$MOUNT_POINT" | awk 'NR==2 {print $4}')
+    
+    log "Available memory: ${available_mem}MB"
+    log "Available storage: ${available_space}KB"
+    
+    if [ "$available_mem" -lt 200 ]; then
+        log "WARNING: Low memory (${available_mem}MB), sync may fail"
+        send_mqtt "nextcloud-sync/warning" "low_memory"
+    fi
+}
+
 log "=== Starting Nextcloud Sync (version $SCRIPT_VERSION) ==="
 log "Using Nextcloud: $NEXTCLOUD_URL"
 log "Syncing to: $SYNC_DIR"
+
+# Check resources
+check_resources
 
 # Check if TrueNAS is mounted
 if ! mountpoint -q "$MOUNT_POINT"; then
@@ -126,30 +135,36 @@ fi
 # Create sync directory if needed
 mkdir -p "$SYNC_DIR"
 
-log "Starting Nextcloud WebDAV sync from root folder..."
+log "Starting Nextcloud WebDAV sync with timeout of ${SYNC_TIMEOUT}s..."
 send_mqtt "nextcloud-sync/status" "syncing"
 
-# Perform sync with WebDAV (syncs entire Nextcloud root)
-rclone sync "nextcloud:" "$SYNC_DIR" \
+# Perform sync with WebDAV with timeout and reduced parallelism for low-resource VM
+timeout $SYNC_TIMEOUT rclone sync "nextcloud:" "$SYNC_DIR" \
     --config "$RCLONE_CONFIG" \
     --log-level INFO \
     --log-file "$LOGFILE" \
-    --transfers 4 \
-    --checkers 8 \
-    --retries 3 \
-    --low-level-retries 10 \
-    --stats 30s \
+    --transfers 2 \
+    --checkers 4 \
+    --retries 2 \
+    --low-level-retries 3 \
+    --timeout 60s \
+    --contimeout 30s \
+    --stats 60s \
+    --stats-one-line \
     --exclude ".DS_Store" \
     --exclude "Thumbs.db" \
     --exclude "*.tmp" \
     --exclude ".*" \
-    --exclude "desktop.ini"
+    --exclude "desktop.ini" \
+    --exclude "*.lock" \
+    --max-size 100M \
+    --progress
 
 SYNC_RESULT=$?
 
 if [ $SYNC_RESULT -eq 0 ]; then
-    SIZE=$(du -sh "$SYNC_DIR" 2>/dev/null | cut -f1)
-    FILES=$(find "$SYNC_DIR" -type f 2>/dev/null | wc -l)
+    SIZE=$(du -sh "$SYNC_DIR" 2>/dev/null | cut -f1 || echo "unknown")
+    FILES=$(find "$SYNC_DIR" -type f 2>/dev/null | wc -l || echo "unknown")
     log "Sync completed successfully - $FILES files ($SIZE total)"
     
     # Send success status to Home Assistant
@@ -157,6 +172,9 @@ if [ $SYNC_RESULT -eq 0 ]; then
     send_mqtt "nextcloud-sync/last_sync" "$(date -Iseconds)"
     send_mqtt "nextcloud-sync/file_count" "$FILES"
     send_mqtt "nextcloud-sync/size" "$SIZE"
+elif [ $SYNC_RESULT -eq 124 ]; then
+    log "Sync timed out after ${SYNC_TIMEOUT} seconds"
+    send_mqtt "nextcloud-sync/status" "timeout"
 else
     log "Sync failed with exit code $SYNC_RESULT"
     send_mqtt "nextcloud-sync/status" "failed"
